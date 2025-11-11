@@ -1,213 +1,105 @@
-"""
-Misinformation Detection & Wikipedia Verification
-"""
-
-import pandas as pd
-import numpy as np
-import re
-import pickle
 import wikipedia
-from sklearn.model_selection import train_test_split
+import numpy as np
+import pandas as pd
+import re
+from sentence_transformers import SentenceTransformer, util
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
-import matplotlib.pyplot as plt
-import seaborn as sns
-import warnings
-warnings.filterwarnings('ignore')
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 
+# ---------------------------
+# STEP 1 — Data Preparation
+# ---------------------------
+data = {
+    'text': [
+        "The earth revolves around the sun",
+        "The moon is made of cheese",
+        "Water boils at 100 degrees Celsius",
+        "Humans can breathe underwater without oxygen tanks",
+        "The Eiffel Tower is in Paris",
+        "Mango is a fruit",
+        "The Great Wall of China is visible from space"
+    ],
+    'label': ['real', 'fake', 'real', 'fake', 'real', 'real', 'fake']
+}
+df = pd.DataFrame(data)
 
-class MisinformationDetector:
-    """ML pipeline for misinformation detection + Wikipedia verification"""
+# ---------------------------
+#  STEP 2 — Model Training
+# ---------------------------
+X_train, X_test, y_train, y_test = train_test_split(df['text'], df['label'], test_size=0.3, random_state=42)
 
-    def __init__(self):
-        self.models = {}
-        self.vectorizer = None
-        self.feature_names = []
+vectorizer = TfidfVectorizer(stop_words='english')
+X_train_vec = vectorizer.fit_transform(X_train)
+X_test_vec = vectorizer.transform(X_test)
 
-    # ------------------------------
-    # DATA LOADING
-    # ------------------------------
-    def load_data(self, true_path='True.csv', fake_path='Fake.csv'):
-        """Load and label the dataset"""
-        true_df = pd.read_csv(true_path, engine='python', on_bad_lines='skip')
-        fake_df = pd.read_csv(fake_path, engine='python', on_bad_lines='skip')
+model = RandomForestClassifier(n_estimators=100, random_state=42)
+model.fit(X_train_vec, y_train)
 
-        true_df['label'] = 1
-        fake_df['label'] = 0
+y_pred = model.predict(X_test_vec)
+print("\n Classification Report:\n")
+print(classification_report(y_test, y_pred))
 
-        df = pd.concat([true_df, fake_df], ignore_index=True)
-        df = df.drop('subject', axis=1, errors='ignore')
+# ---------------------------
+#  STEP 3 — Wikipedia Verification + Semantic Similarity
+# ---------------------------
+semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-        print(f"Loaded {len(df)} total articles.")
-        self.df = df
-        return df
+def clean_text(text):
+    return re.sub(r'[^a-zA-Z0-9\s]', '', text.lower())
 
-    # ------------------------------
-    # FEATURE ENGINEERING
-    # ------------------------------
-    def extract_features(self, df):
-        df['title_length'] = df['title'].str.len()
-        df['title_words'] = df['title'].str.split().str.len()
-        df['text_length'] = df['text'].str.len()
-        df['text_words'] = df['text'].str.split().str.len()
-        df['exclamation_count'] = df['text'].apply(lambda x: str(x).count('!'))
-        df['question_count'] = df['text'].apply(lambda x: str(x).count('?'))
-        df['quote_count'] = df['text'].apply(lambda x: str(x).count('"'))
-        df['url_count'] = df['text'].apply(lambda x: len(re.findall(r'http[s]?://\S+', str(x))))
-        df['number_count'] = df['text'].apply(lambda x: len(re.findall(r'\d+', str(x))))
-        df['caps_ratio'] = df['text'].apply(lambda x: sum(1 for c in str(x) if c.isupper()) / max(len(str(x)), 1))
+def check_with_wikipedia(statement):
+    try:
+        search_results = wikipedia.search(statement)
+        if not search_results:
+            return None, 0.0, None
 
-        emotional_words = ['shocking', 'amazing', 'unbelievable', 'secret', 'exposed',
-                           'truth', 'alert', 'warning', 'urgent', 'breaking']
-        df['emotional_words'] = df['text'].apply(lambda x: sum(str(x).lower().count(word) for word in emotional_words))
-        df['combined_text'] = df['title'] + ' ' + df['text']
+        page_title = search_results[0]
+        summary = wikipedia.summary(page_title, sentences=2)
+        return page_title, summary, wikipedia.page(page_title).url
+    except Exception:
+        return None, None, None
 
-        self.feature_names = [
-            'title_length', 'title_words', 'text_length', 'text_words',
-            'exclamation_count', 'question_count', 'quote_count',
-            'url_count', 'number_count', 'caps_ratio', 'emotional_words'
-        ]
-        return df
+def verify_misinformation(statement):
+    # Step 1: Predict with ML model
+    input_vec = vectorizer.transform([statement])
+    model_pred = model.predict(input_vec)[0]
+    model_prob = model.predict_proba(input_vec)[0]
+    confidence = max(model_prob)
 
-    # ------------------------------
-    # DATA PREPARATION
-    # ------------------------------
-    def prepare_data(self):
-        self.df = self.extract_features(self.df)
-        X_engineered = self.df[self.feature_names].fillna(0)
+    # Step 2: Wikipedia check
+    title, summary, link = check_with_wikipedia(statement)
+    if summary:
+        emb1 = semantic_model.encode(clean_text(statement), convert_to_tensor=True)
+        emb2 = semantic_model.encode(clean_text(summary), convert_to_tensor=True)
+        similarity = float(util.cos_sim(emb1, emb2).item())
+    else:
+        similarity = 0.0
 
-        self.vectorizer = TfidfVectorizer(max_features=5000, stop_words='english', ngram_range=(1, 2))
-        X_tfidf = self.vectorizer.fit_transform(self.df['combined_text'])
+    # Step 3: Combined Score
+    final_score = 0.6 * confidence + 0.4 * similarity
 
-        X_combined = np.hstack([X_engineered.values, X_tfidf.toarray()])
-        y = self.df['label'].values
-        return train_test_split(X_combined, y, test_size=0.2, random_state=42, stratify=y)
+    label = "Misinformation" if final_score < 0.5 else "Likely True"
 
-    # ------------------------------
-    # MODEL TRAINING
-    # ------------------------------
-    def train_models(self):
-        X_train, X_test, y_train, y_test = self.prepare_data()
+    return {
+        "input": statement,
+        "model_label": model_pred,
+        "model_confidence": round(confidence * 100, 2),
+        "wikipedia_article": title,
+        "similarity_score": round(similarity, 2),
+        "final_label": label,
+        "final_score": round(final_score * 100, 2),
+        "wiki_summary": summary,
+        "wiki_link": link
+    }
 
-        models = {
-            'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
-            'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
-            'Gradient Boosting': GradientBoostingClassifier(n_estimators=100, random_state=42),
-            'Naive Bayes': MultinomialNB()
-        }
+# ---------------------------
+#  STEP 4 — Test the Model
+# ---------------------------
+user_input = "Breaking news Mango is a fruit"
+result = verify_misinformation(user_input)
 
-        results = {}
-        for name, model in models.items():
-            print(f"\nTraining {name}...")
-            X_train_mod = np.abs(X_train) if name == 'Naive Bayes' else X_train
-            X_test_mod = np.abs(X_test) if name == 'Naive Bayes' else X_test
-
-            model.fit(X_train_mod, y_train)
-            y_pred = model.predict(X_test_mod)
-            y_proba = model.predict_proba(X_test_mod)[:, 1]
-
-            acc = np.mean(y_pred == y_test)
-            auc = roc_auc_score(y_test, y_proba)
-            results[name] = {'model': model, 'accuracy': acc, 'auc': auc}
-            print(f"Accuracy: {acc:.4f}, AUC: {auc:.4f}")
-
-        best_model_name = max(results, key=lambda x: results[x]['auc'])
-        self.best_model = results[best_model_name]['model']
-        self.best_model_name = best_model_name
-        self.results = results
-        self.X_test = X_test
-        self.y_test = y_test
-
-        print(f"\n Best Model: {best_model_name} (AUC: {results[best_model_name]['auc']:.4f})")
-
-    # ------------------------------
-    # EVALUATION
-    # ------------------------------
-    def evaluate_model(self):
-        best_model = self.best_model
-        y_pred = best_model.predict(self.X_test)
-        print(f"\nClassification Report - {self.best_model_name}:")
-        print(classification_report(self.y_test, y_pred, target_names=['Fake', 'True']))
-
-        cm = confusion_matrix(self.y_test, y_pred)
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-        plt.title(f"Confusion Matrix - {self.best_model_name}")
-        plt.show()
-
-    # ------------------------------
-    # WIKIPEDIA FACT CHECK
-    # ------------------------------
-    def check_with_wikipedia(self, statement):
-        """Returns a factual confidence score (0–1) using Wikipedia"""
-        try:
-            results = wikipedia.search(statement)
-            if not results:
-                return 0.2, "No related article found"
-
-            summary = wikipedia.summary(results[0], sentences=2)
-            overlap = len(set(statement.lower().split()) & set(summary.lower().split()))
-            confidence = min(1, overlap / (len(statement.split()) + 1))
-            return confidence, summary
-
-        except (wikipedia.exceptions.DisambiguationError,
-                wikipedia.exceptions.PageError,
-                wikipedia.exceptions.HTTPTimeoutError,
-                Exception):
-            return 0.1, "Wikipedia lookup failed or no relevant info found"
-
-    # ------------------------------
-    # FINAL RISK SCORE
-    # ------------------------------
-    def calculate_risk_score(self, text, title=''):
-        """Predict misinformation risk using ML + Wikipedia"""
-        features = {
-            'title_length': len(title),
-            'title_words': len(title.split()),
-            'text_length': len(text),
-            'text_words': len(text.split()),
-            'exclamation_count': text.count('!'),
-            'question_count': text.count('?'),
-            'quote_count': text.count('"'),
-            'url_count': len(re.findall(r'http[s]?://\S+', text)),
-            'number_count': len(re.findall(r'\d+', text)),
-            'caps_ratio': sum(1 for c in text if c.isupper()) / max(len(text), 1),
-            'emotional_words': sum(text.lower().count(w) for w in
-                                   ['shocking', 'amazing', 'unbelievable', 'secret', 'breaking'])
-        }
-
-        X_eng = np.array([[features[f] for f in self.feature_names]])
-        combined_text = title + ' ' + text
-        X_tfidf = self.vectorizer.transform([combined_text])
-        X_combined = np.hstack([X_eng, X_tfidf.toarray()])
-        if self.best_model_name == 'Naive Bayes':
-            X_combined = np.abs(X_combined)
-
-        ml_score = self.best_model.predict_proba(X_combined)[0][0]
-        wiki_conf, wiki_summary = self.check_with_wikipedia(text)
-
-        # Weighted risk (lower wiki_conf → higher misinformation risk)
-        risk = (ml_score * 0.6) + ((1 - wiki_conf) * 0.4)
-        risk_percent = risk * 100
-
-        print(f"\n ML Predicted Risk: {ml_score*100:.2f}%")
-        print(f" Wikipedia Confidence: {wiki_conf*100:.2f}%")
-        print(f" Summary: {wiki_summary}")
-        print(f" Final Misinformation Risk: {risk_percent:.2f}% ({self.best_model_name})")
-
-        return risk_percent
-
-
-# ------------------------------
-# USAGE EXAMPLE
-# ------------------------------
-if __name__ == "__main__":
-    detector = MisinformationDetector()
-    detector.load_data()
-    detector.train_models()
-    detector.evaluate_model()
-
-    sample = "BREAKING: Scientists reveal shocking truth about aliens discovered on Mars!"
-    detector.calculate_risk_score(sample, "Shocking Discovery on Mars!")
+print("\n Analysis Result:")
+for k, v in result.items():
+    print(f"{k}: {v}")
