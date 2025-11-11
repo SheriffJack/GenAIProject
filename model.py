@@ -252,6 +252,10 @@ if __name__ == "__main__":
     detector.load_data()
     detector.train_models()
     detector.evaluate_model()
-    
+    with open("model.pkl", "wb") as f:
+        pickle.dump(detector.best_model, f)
+    with open("vectorizer.pkl", "wb") as f:
+        pickle.dump(detector.vectorizer, f)
+
     sample = "BREAKING: Scientists reveal shocking truth about aliens discovered on Mars!"
     detector.calculate_risk_score(sample, "Shocking Discovery on Mars!")
